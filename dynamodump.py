@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import threading
+import multiprocessing
 import datetime
 import errno
 import sys
@@ -530,7 +531,7 @@ def do_empty(dynamo, table_name):
         datetime.datetime.now().replace(microsecond=0) - start_time))
 
 
-def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
+def do_backup(dynamo, read_capacity, args, tableQueue=None, srcTable=None):
     """
     Connect to DynamoDB and perform the backup for srcTable or each table in tableQueue
     """
@@ -573,31 +574,19 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
                 logging.info("Dumping table items for " + table_name)
                 mkdir_p(args.dumpPath + os.sep + table_name + os.sep + DATA_DIR)
 
-                i = 1
-                last_evaluated_key = None
-
-                while True:
-                    try:
-                        scanned_table = dynamo.scan(table_name,
-                                                    exclusive_start_key=last_evaluated_key)
-                    except ProvisionedThroughputExceededException:
-                        logging.error("EXCEEDED THROUGHPUT ON TABLE " +
-                                      table_name + ".  BACKUP FOR IT IS USELESS.")
-                        tableQueue.task_done()
-
-                    f = open(
-                        args.dumpPath + os.sep + table_name + os.sep + DATA_DIR + os.sep +
-                        str(i).zfill(4) + ".json", "w+"
+                pool_size = 8
+                pool = multiprocessing.Pool(processes=pool_size)
+                for i in range(pool_size):
+                    pool.apply_async(process_segment, kwds={
+                            'table_name': table_name,
+                            'args': args,
+                            'segment': i,
+                            'total_segments': pool_size,
+                        },
                     )
-                    f.write(json.dumps(scanned_table, indent=JSON_INDENT))
-                    f.close()
 
-                    i += 1
-
-                    try:
-                        last_evaluated_key = scanned_table["LastEvaluatedKey"]
-                    except KeyError:
-                        break
+                pool.close()
+                pool.join()
 
                 # revert back to original table read capacity if specified
                 if read_capacity is not None and read_capacity != original_read_capacity:
@@ -611,6 +600,40 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
                     datetime.datetime.now().replace(microsecond=0) - start_time))
 
             tableQueue.task_done()
+
+
+def process_segment(table_name='invalid', args=None, segment=0, total_segments=0):
+    idx = 1
+    last_evaluated_key = None
+
+    if not args.profile:
+        conn = boto.dynamodb2.connect_to_region(args.region, aws_access_key_id=args.accessKey,
+                                                aws_secret_access_key=args.secretKey)
+    else:
+        conn = boto.dynamodb2.connect_to_region(args.region, profile_name=args.profile)
+
+    while True:
+        try:
+            scanned_table = conn.scan(
+                table_name, segment=segment, total_segments=total_segments,
+                exclusive_start_key=last_evaluated_key)
+        except ProvisionedThroughputExceededException:
+            logging.error("EXCEEDED THROUGHPUT ON TABLE " +
+                          table_name + ".  BACKUP FOR IT IS USELESS.")
+
+        f = open(
+            args.dumpPath + os.sep + table_name + os.sep + DATA_DIR + os.sep +
+            str(segment).zfill(2) + '_' + str(idx).zfill(4) + ".json", "w+"
+        )
+        f.write(json.dumps(scanned_table, indent=JSON_INDENT))
+        f.close()
+
+        idx += 1
+
+        try:
+            last_evaluated_key = scanned_table["LastEvaluatedKey"]
+        except KeyError:
+            break
 
 
 def do_restore(dynamo, sleep_interval, source_table, destination_table, write_capacity):
@@ -917,9 +940,9 @@ def main():
 
         try:
             if args.srcTable.find("*") == -1:
-                do_backup(conn, args.read_capacity, tableQueue=None)
+                do_backup(conn, args.read_capacity, args, tableQueue=None)
             else:
-                do_backup(conn, args.read_capacity, matching_backup_tables)
+                do_backup(conn, args.read_capacity, args, matching_backup_tables)
         except AttributeError:
             # Didn't specify srcTable if we get here
 
@@ -927,7 +950,7 @@ def main():
             threads = []
 
             for i in range(MAX_NUMBER_BACKUP_WORKERS):
-                t = threading.Thread(target=do_backup, args=(conn, args.readCapacity),
+                t = threading.Thread(target=do_backup, args=(conn, args.readCapacity, args),
                                      kwargs={"tableQueue": q})
                 t.start()
                 threads.append(t)
